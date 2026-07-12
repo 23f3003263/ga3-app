@@ -124,7 +124,7 @@ async def answer_image(request: Request):
         ans = ""
     return {"answer": str(ans)}
 
-# ===== Q3: /extract (invoice fixed schema) =====
+# ===== Q3: /extract =====
 @app.post("/extract")
 async def extract(request: Request):
     body = await request.json()
@@ -146,7 +146,7 @@ Rules:
 - is_paid: true if paid/cleared, false if pending/awaiting
 - priority: one of low/normal/high/urgent
 - contact_email: lowercase string, null if not found
-- line_items: array of objects with keys sku, quantity (int), unit_price (int). ALWAYS extract all items.
+- line_items: array of objects with keys sku, quantity (int), unit_price (int)
 - item_count: integer count of line_items
 
 Invoice text:
@@ -165,124 +165,80 @@ Invoice text:
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    # ===== Q7: dynamic schema (document_id + text + schema) =====
+    # ===== Q7: document_id + text + schema =====
     text = body.get("text", "")
     schema = body.get("schema", {})
+    document_id = body.get("document_id", "")
 
-    # JSON Schema → simple field list extract karo
-    props = {}
-    if "properties" in schema:
-        props = schema["properties"]
-    
-    from datetime import datetime
+    prompt = f"""You are a precise data extraction assistant.
 
-    def get_type(prop_def):
-        t = prop_def.get("type", "string")
-        fmt = prop_def.get("format", "")
-        if fmt == "date": return "date"
-        if t == "number": return "float"
-        if t == "integer": return "integer"
-        if t == "boolean": return "boolean"
-        if t == "array":
-            items_type = prop_def.get("items", {}).get("type", "string")
-            return f"array[{items_type}]"
-        if t == "object": return "object"
-        return "string"
+Extract ALL fields from the document text below according to the schema provided.
 
-    def coerce(key, value, prop_def):
-        if value is None:
-            return None
-        type_str = get_type(prop_def)
-        try:
-            if type_str == "string":
-                s = str(value)
-                if "email" in key.lower() or "@" in s:
-                    return s.lower()
-                return s
-            if type_str == "integer":
-                return int(float(re.sub(r'[^\d.-]', '', str(value))))
-            if type_str == "float":
-                return float(re.sub(r'[^\d.-]', '', str(value)))
-            if type_str == "boolean":
-                if isinstance(value, bool): return value
-                return str(value).lower() in ("true", "1", "yes")
-            if type_str == "date":
-                s = str(value).strip()
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", s): return s
-                s2 = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', s).strip()
-                for fmt in ["%d %B %Y", "%d %b %Y", "%B %d %Y", "%d/%m/%Y", "%m/%d/%Y"]:
-                    for src in (s2, s):
-                        try: return datetime.strptime(src, fmt).strftime("%Y-%m-%d")
-                        except: pass
-                return s
-            if type_str == "array[string]":
-                return [str(v) for v in value] if isinstance(value, list) else [str(value)]
-            if type_str == "array[integer]":
-                return [int(float(str(v))) for v in value] if isinstance(value, list) else [int(float(str(value)))]
-            if type_str == "object":
-                return value
-        except:
-            pass
-        return None
-
-    # Field descriptions for prompt
-    field_desc = []
-    for k, v in props.items():
-        t = get_type(v)
-        desc = v.get("description", "")
-        field_desc.append(f"- {k} ({t}){': ' + desc if desc else ''}")
-    field_list = "\n".join(field_desc)
-
-    prompt = f"""Extract the following fields from the document text below.
-
-Fields to extract:
-{field_list}
-
-CRITICAL RULES:
-- Return a flat JSON object with EXACTLY these keys: {list(props.keys())}
-- currency: MUST be ISO 4217 code only ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥=JPY)
-- email fields: must be lowercase
-- dates: YYYY-MM-DD format
-- numbers: JSON numbers not strings
-- line_items: MUST be a JSON array of objects. Each product/item row in the text = one object with keys:
-  * sku: product code or name (string)
-  * quantity: how many units (integer)
-  * unit_price: price per unit (integer)
-  Extract ALL items. Example: [{{"sku":"ABC-123","quantity":5,"unit_price":100}}]
-- All array fields: use empty array [] if nothing found, NEVER null or {{}}
-- boolean fields: true or false only
-- Use null only for missing non-array string/number fields
+STRICT RULES:
+- Extract EVERY field defined in the schema
+- currency: return ISO 4217 code ONLY (dollars/$=USD, pounds/£=GBP, euros/€=EUR, rupees/₹=INR, yen/¥=JPY)
+- email: always lowercase
+- dates: YYYY-MM-DD format only
+- numbers: JSON numbers, never strings
+- line_items: extract EVERY product/item row you find. Each item needs sku, quantity (integer), unit_price (integer)
+- arrays: NEVER return null for arrays, use [] if empty
+- boolean: true or false only
 
 DOCUMENT TEXT:
-{text}"""
+{text}
+
+Return a JSON object matching this schema exactly:
+{json.dumps(schema, indent=2)}"""
+
     try:
-        raw = await chat([{"role": "user", "content": prompt}],
-                         model="gpt-4o", max_tokens=1500)
-        extracted = parse_json(raw)
-    except:
-        extracted = {}
-
-    result = {}
-    # line_items special handling
-    for k, prop_def in props.items():
-        if k == "line_items" and (not result.get(k)):
-            # Dedicated line items extraction
-            items_prompt = f"""From this text, extract ALL product line items as a JSON array.
-Each item must have: sku (string), quantity (integer), unit_price (integer).
-Return ONLY a JSON object like: {{"line_items": [{{"sku":"X","quantity":1,"unit_price":10}}]}}
-
-TEXT:
-{text}"""
-            try:
-                items_raw = await chat([{"role": "user", "content": items_prompt}],
-                                      model="gpt-4o", max_tokens=800)
-                items_parsed = parse_json(items_raw)
-                if items_parsed.get("line_items"):
-                    result["line_items"] = items_parsed["line_items"]
-            except:
-                pass
-
-    return JSONResponse(result)
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(
+                f"{config.AIPIPE_BASE}/chat/completions",
+                headers=HEAD,
+                json={
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0,
+                    "max_tokens": 2000,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "extraction",
+                            "strict": True,
+                            "schema": schema
+                        }
+                    }
+                }
+            )
+            if r.status_code == 200:
+                result = json.loads(r.json()["choices"][0]["message"]["content"])
+                # Fix email lowercase
+                for k, v in result.items():
+                    if isinstance(v, str) and ("email" in k.lower() or "@" in v):
+                        result[k] = v.lower()
+                return JSONResponse(result)
+            else:
+                # Fallback: plain json_object
+                r2 = await c.post(
+                    f"{config.AIPIPE_BASE}/chat/completions",
+                    headers=HEAD,
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0,
+                        "max_tokens": 2000,
+                        "response_format": {"type": "json_object"}
+                    }
+                )
+                r2.raise_for_status()
+                result = parse_json(r2.json()["choices"][0]["message"]["content"])
+                for k, v in result.items():
+                    if isinstance(v, str) and ("email" in k.lower() or "@" in v):
+                        result[k] = v.lower()
+                return JSONResponse(result)
+    except Exception as e:
+        last_debug_info["q7_error"] = str(e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 # ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
