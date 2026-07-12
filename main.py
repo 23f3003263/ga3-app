@@ -147,53 +147,38 @@ async def extract(request: Request):
 
     if "invoice_text" in body:
         text = body.get("invoice_text", "") or ""
-
-        result = {
-            "invoice_no": None,
-            "date": None,
-            "vendor": None,
-            "amount": None,
-            "tax": None,
-            "currency": "INR",
-        }
-
-        try:
-            prompt = f"""Extract invoice fields from the text below.
-Return JSON with EXACTLY these 6 keys (no extras, no missing):
-invoice_no, date, vendor, amount, tax, currency
+        prompt = f"""Extract invoice fields from the text below.
+Return JSON with EXACTLY these keys (no extras, no missing):
+invoice_no, vendor, currency, total_amount, invoice_date, due_in_days, is_paid, priority, contact_email, line_items, item_count
 
 Rules:
-- invoice_no: invoice number as a string, null if not found
-- date: ISO format YYYY-MM-DD, null if not found
-- vendor: vendor/biller name exactly as written, null if not found
-- amount: the SUBTOTAL before tax, as a plain number (not a string), null if not found
-- tax: the tax amount only (e.g. the GST/IGST/VAT amount, not the grand total), as a plain number, null if not found
-- currency: ISO 4217 code. Rs./₹ = INR, $ = USD, € = EUR, £ = GBP, ¥ = JPY.
-  If a rupee symbol or "Rs." appears anywhere, use "INR".
+- invoice_no: invoice number as string, null if not found
+- vendor: biller name exactly as written
+- currency: ISO 4217 code ONLY (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
+- total_amount: integer (12K=12000, "twelve thousand"=12000)
+- invoice_date: YYYY-MM-DD
+- due_in_days: integer ("Net 30"=30, "two weeks"=14)
+- is_paid: true if paid/cleared, false if pending/awaiting
+- priority: one of low/normal/high/urgent
+- contact_email: lowercase string, null if not found
+- line_items: array of objects with keys sku, quantity (int), unit_price (int)
+- item_count: integer count of line_items
 
 Invoice text:
 {text}"""
-            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
-
-            def to_number(v):
-                if v is None:
-                    return None
-                try:
-                    cleaned = str(v).replace(",", "").replace("Rs.", "").replace("₹", "").strip()
-                    return float(cleaned)
-                except (ValueError, TypeError):
-                    return None
-
-            result["invoice_no"] = out.get("invoice_no") or None
-            result["date"] = out.get("date") or None
-            result["vendor"] = out.get("vendor") or None
-            result["amount"] = to_number(out.get("amount"))
-            result["tax"] = to_number(out.get("tax"))
-            result["currency"] = out.get("currency") or "INR"
+        try:
+            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=1500))
+            out["total_amount"] = int(float(str(out.get("total_amount", 0)).replace(",", "")))
+            out["due_in_days"] = int(out.get("due_in_days", 0))
+            out["is_paid"] = bool(out.get("is_paid", False))
+            out["item_count"] = int(out.get("item_count", len(out.get("line_items", []))))
+            out["contact_email"] = str(out.get("contact_email", "")).lower()
+            for item in out.get("line_items", []):
+                item["quantity"] = int(item.get("quantity", 0))
+                item["unit_price"] = int(float(str(item.get("unit_price", 0)).replace(",", "")))
+            return JSONResponse(out)
         except Exception as e:
-            last_debug_info["q3_error"] = str(e)
-
-        return JSONResponse(result)
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     text = body.get("text", "")
     schema = body.get("schema", {})
@@ -223,6 +208,10 @@ Return a JSON object matching this schema exactly:
 
     try:
         async with httpx.AsyncClient(timeout=90) as c:
+            props = schema.get("properties", {})
+            required = schema.get("required", list(props.keys()))
+            clean_schema = {"type": "object", "properties": props, "required": required}
+
             r = await c.post(
                 f"{config.AIPIPE_BASE}/chat/completions",
                 headers=HEAD,
@@ -234,37 +223,25 @@ Return a JSON object matching this schema exactly:
                     "response_format": {
                         "type": "json_schema",
                         "json_schema": {
-                            "name": "extraction",
-                            "strict": True,
-                            "schema": schema
+                            "name": "invoice_extraction",
+                            "strict": False,
+                            "schema": clean_schema
                         }
                     }
                 }
             )
-            if r.status_code == 200:
-                result = json.loads(r.json()["choices"][0]["message"]["content"])
-                for k, v in result.items():
-                    if isinstance(v, str) and ("email" in k.lower() or "@" in v):
-                        result[k] = v.lower()
-                return JSONResponse(result)
-            else:
-                r2 = await c.post(
-                    f"{config.AIPIPE_BASE}/chat/completions",
-                    headers=HEAD,
-                    json={
-                        "model": "gpt-4o",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0,
-                        "max_tokens": 2000,
-                        "response_format": {"type": "json_object"}
-                    }
-                )
-                r2.raise_for_status()
-                result = parse_json(r2.json()["choices"][0]["message"]["content"])
-                for k, v in result.items():
-                    if isinstance(v, str) and ("email" in k.lower() or "@" in v):
-                        result[k] = v.lower()
-                return JSONResponse(result)
+            r.raise_for_status()
+            result = json.loads(r.json()["choices"][0]["message"]["content"])
+            for k, v in result.items():
+                if isinstance(v, str) and ("email" in k.lower() or "@" in v):
+                    result[k] = v.lower()
+            if "line_items" in result:
+                for item in result["line_items"]:
+                    item["quantity"] = int(item.get("quantity", 0))
+                    item["unit_price"] = int(float(str(item.get("unit_price", 0)).replace(",", "")))
+            if "item_count" in result and "line_items" in result:
+                result["item_count"] = len(result["line_items"])
+            return JSONResponse(result)
     except Exception as e:
         last_debug_info["q7_error"] = str(e)
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -276,7 +253,7 @@ def coerce_type(value, expected_type):
     et = str(expected_type).lower().strip()
     try:
         if et == "string":
-            return str(value).strip().rstrip(".").strip()
+            return str(value).strip()
         if et == "integer":
             return int(round(float(str(value).replace(",", ""))))
         if et in ("float", "number"):
@@ -285,15 +262,12 @@ def coerce_type(value, expected_type):
             s = str(value).strip()
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
                 return s
-            try:
-                from datetime import datetime
-                for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d %B %Y", "%B %d, %Y", "%B %d %Y"):
-                    try:
-                        return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
-                    except ValueError:
-                        continue
-            except Exception:
-                pass
+            from datetime import datetime
+            for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d %B %Y", "%B %d, %Y", "%B %d %Y"):
+                try:
+                    return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
             return s or None
         if et == "boolean":
             if isinstance(value, bool):
@@ -316,7 +290,6 @@ async def dynamic_extract(request: Request):
 
     text = body.get("text", "") or ""
     schema = body.get("schema", {}) or {}
-
     result = {k: None for k in schema.keys()}
 
     if not text or not schema:
@@ -324,24 +297,23 @@ async def dynamic_extract(request: Request):
 
     field_desc = "\n".join(f'- "{k}": {v}' for k, v in schema.items())
     prompt = f"""Extract the following fields from the text below. Return a JSON object
-with EXACTLY these keys, no extras, no missing keys. If a field cannot be found in
-the text, use null for that field.
+with EXACTLY these keys, no extras, no missing keys. If a field cannot be found, use null.
 
-Fields to extract (name: type):
+Fields (name: type):
 {field_desc}
 
 Rules:
-- "date" type fields must be ISO format YYYY-MM-DD
-- "integer" and "float" type fields must be plain numbers, not strings
-- "string" type fields should be the exact SHORTEST value (e.g. just the name, not a full sentence)
-- "boolean" type fields must be true or false
+- date fields: ISO format YYYY-MM-DD
+- integer/float fields: plain numbers, not strings
+- currency fields: ISO 4217 code only (£=GBP, $=USD, €=EUR, ₹=INR)
+- email fields: lowercase
+- boolean fields: true or false
 
 Text:
 {text}"""
 
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
-        last_debug_info["q4_raw_llm_out"] = out
         for key, expected_type in schema.items():
             result[key] = coerce_type(out.get(key), expected_type)
     except Exception as e:
@@ -353,7 +325,6 @@ Text:
 ALL_STATS = ["mean", "std", "variance", "min", "max", "median", "mode",
              "range", "allowed_values", "value_range", "correlation"]
 
-# Korean words for statistics — these must NEVER appear as column names.
 STAT_KEYWORDS_KO = [
     "평균", "표준편차", "분산", "최솟값", "최댓값", "최소", "최대",
     "중앙값", "중간값", "최빈값", "범위", "허용값", "허용된값",
@@ -432,18 +403,29 @@ async def answer_audio(request: Request):
 컬럼명은 반드시 전사본에 나온 그대로 한국어로 사용하세요. 영어로 바꾸지 마세요.
 컬럼명에 숫자가 붙는 경우(예: 점수1, 점수2) 띄어쓰기 없이 붙여서 사용하세요.
 
-CRITICAL: "columns" must contain ONLY the actual data column names (e.g. 점수1,
-점수2, 나이, 소득). NEVER include a statistic word itself as a column name —
-words like 평균(mean), 표준편차(std), 분산(variance), 최솟값/최댓값(min/max),
-중앙값(median), 최빈값(mode), 범위(range), 상관관계(correlation), 허용값
-(allowed_values) are STATISTIC NAMES, not columns, even if they appear in the
-sentence "점수1과 점수2의 평균은 ..." — here 평균 is NOT a column, only
-점수1 and 점수2 are.
+CRITICAL: "columns" must contain ONLY the actual data column names.
+NEVER include statistic words as column names.
+통계 용어(평균, 표준편차, 분산, 최솟값, 최댓값, 중앙값, 최빈값, 범위, 상관관계)는
+컬럼명이 아닙니다.
+
+CRITICAL: "requested_stats" must list ONLY the statistics EXPLICITLY mentioned
+in the transcript. Do NOT add stats that are not mentioned.
+- 평균 = mean
+- 표준편차 = std
+- 분산 = variance
+- 최솟값/최소 = min
+- 최댓값/최대 = max
+- 중앙값 = median
+- 최빈값 = mode
+- 범위 = range
+- 허용값 = allowed_values
+- 값의범위 = value_range
+- 상관관계 = correlation
 
 Return JSON with EXACTLY these keys:
 {{
   "rows": <integer>,
-  "columns": [<컬럼명을 한국어 그대로, 숫자는 붙여쓰기, 통계 용어 제외>],
+  "columns": [<컬럼명만, 통계용어 제외>],
   "mean": {{"컬럼명": value}},
   "std": {{"컬럼명": value}},
   "variance": {{"컬럼명": value}},
@@ -452,14 +434,11 @@ Return JSON with EXACTLY these keys:
   "median": {{"컬럼명": value}},
   "mode": {{"컬럼명": value}},
   "range": {{"컬럼명": value}},
-  "allowed_values": {{"컬럼명": ["값1", "값2"]}},
+  "allowed_values": {{}},
   "value_range": {{"컬럼명": [min, max]}},
-  "correlation": [[col1, col2, value]],
-  "requested_stats": ["<only the stat names ACTUALLY mentioned or asked about in the transcript, chosen from: mean, std, variance, min, max, median, mode, range, allowed_values, value_range, correlation>"]
-}}
-IMPORTANT: "requested_stats" must list ONLY the statistics that the transcript
-explicitly states or asks for. Do NOT include a stat just because you could
-compute or infer it. Empty dict/list for anything not mentioned."""
+  "correlation": [],
+  "requested_stats": ["<only stats EXPLICITLY mentioned>"]
+}}"""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -472,6 +451,7 @@ compute or infer it. Empty dict/list for anything not mentioned."""
     requested_stats = out.get("requested_stats") or []
     last_debug_info["requested_stats"] = requested_stats
 
+    # Start with all empty
     result = dict(empty)
     result["rows"] = int(out.get("rows", 0) or 0)
     raw_cols = [_norm_col(c) for c in (out.get("columns", []) or [])]
@@ -481,27 +461,19 @@ compute or infer it. Empty dict/list for anything not mentioned."""
         val = out.get(stat)
         if stat == "correlation":
             return val if isinstance(val, list) else []
+        if stat in ("allowed_values", "value_range"):
+            return {}
         v = _norm_keys(val) if isinstance(val, dict) else {}
-        # also strip any stat-keyword that slipped in as a dict key
         return {k: vv for k, vv in v.items() if not _is_stat_keyword(k)}
 
+    # ONLY return stats that are explicitly requested
     for stat in ALL_STATS:
-        if stat == "allowed_values":
-            result[stat] = {}
-            continue
-        if stat == "value_range":
-            result[stat] = {}
+        if stat in ("allowed_values", "value_range", "correlation"):
+            result[stat] = {} if stat != "correlation" else []
             continue
         if requested_stats and stat in requested_stats:
             result[stat] = _get_stat(stat)
-
-    if not requested_stats:
-        for stat in ALL_STATS:
-            if stat in ("allowed_values", "value_range"):
-                continue
-            v = _get_stat(stat)
-            if (stat == "correlation" and v) or (stat != "correlation" and v):
-                result[stat] = v
+        # else stays empty {}
 
     audio_history.append({"audio_id": audio_id, "transcript": transcript,
                            "requested_stats": requested_stats, "answer": result})
