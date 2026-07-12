@@ -138,7 +138,6 @@ async def answer_image(request: Request):
 async def extract(request: Request):
     body = await request.json()
 
-    # Q3: fixed invoice schema
     if "invoice_text" in body:
         text = body["invoice_text"]
         prompt = f"""Extract invoice fields from the text below.
@@ -149,12 +148,12 @@ Rules:
 - invoice_no: invoice number as string, null if not found
 - vendor: biller name exactly as written
 - currency: ISO 4217 code (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
-- total_amount: integer (strip decimals, 12K=12000, words like "twelve thousand"=12000)
+- total_amount: integer (12K=12000, "twelve thousand"=12000)
 - invoice_date: YYYY-MM-DD
-- due_in_days: integer ("Net 30"=30, "two weeks"=14, "45 days"=45)
+- due_in_days: integer ("Net 30"=30, "two weeks"=14)
 - is_paid: true if paid/cleared, false if pending/awaiting
 - priority: one of low/normal/high/urgent
-- contact_email: lowercase string
+- contact_email: lowercase string, null if not found
 - line_items: array of objects with keys sku, quantity (int), unit_price (int)
 - item_count: integer count of line_items
 
@@ -235,7 +234,7 @@ Text:
 
     return JSONResponse({k: coerce(extracted.get(k), v) for k, v in schema.items()})
 
-# ===== Q4: /answer-audio =====
+# ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
     global last_debug_info
@@ -281,26 +280,29 @@ async def answer_audio(request: Request):
                  "allowed_values": {}, "value_range": {}, "correlation": []}
         return JSONResponse(empty)
 
-    parse_prompt = f"""Korean audio transcript:
+    parse_prompt = f"""다음은 한국어 오디오 전사본입니다:
 {transcript}
 
-Extract dataset statistics. Return JSON with EXACTLY these keys:
+위 전사본에서 데이터셋 통계를 추출하세요.
+컬럼명은 반드시 전사본에 나온 그대로 한국어로 사용하세요. 영어로 바꾸지 마세요.
+
+Return JSON with EXACTLY these keys:
 {{
   "rows": <integer>,
-  "columns": [<column names as strings>],
-  "mean": {{"col": value}},
-  "std": {{"col": value}},
-  "variance": {{"col": value}},
-  "min": {{"col": value}},
-  "max": {{"col": value}},
-  "median": {{"col": value}},
-  "mode": {{"col": value}},
-  "range": {{"col": value}},
-  "allowed_values": {{"col": [values]}},
-  "value_range": {{"col": [min, max]}},
+  "columns": [<컬럼명을 한국어 그대로>],
+  "mean": {{"컬럼명": value}},
+  "std": {{"컬럼명": value}},
+  "variance": {{"컬럼명": value}},
+  "min": {{"컬럼명": value}},
+  "max": {{"컬럼명": value}},
+  "median": {{"컬럼명": value}},
+  "mode": {{"컬럼명": value}},
+  "range": {{"컬럼명": value}},
+  "allowed_values": {{}},
+  "value_range": {{"컬럼명": [min, max]}},
   "correlation": [[col1, col2, value]]
 }}
-Use empty dict or empty list if not mentioned."""
+Empty dict or empty list if not mentioned."""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -321,7 +323,7 @@ Use empty dict or empty list if not mentioned."""
         "median": out.get("median", {}),
         "mode": out.get("mode", {}),
         "range": out.get("range", {}),
-        "allowed_values": {}),
+        "allowed_values": {},
         "value_range": out.get("value_range", {}),
         "correlation": out.get("correlation", [])
     }
