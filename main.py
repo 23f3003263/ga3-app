@@ -252,8 +252,15 @@ Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
 - No extra keys allowed"""
 
     try:
-        raw = await chat([{"role": "user", "content": prompt}],
-                         model="gpt-4o-mini", max_tokens=512)
+        # Cache bypass - direct call
+        body_req = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0, "max_tokens": 512,
+                "response_format": {"type": "json_object"}}
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
+                             headers=HEAD, json=body_req)
+            r.raise_for_status()
+            raw = r.json()["choices"][0]["message"]["content"]
         extracted = parse_json(raw)
     except:
         extracted = {}
