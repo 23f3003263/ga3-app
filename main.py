@@ -352,6 +352,9 @@ Text:
     return JSONResponse(result)
 
 # ===== Q6: /answer-audio =====
+ALL_STATS = ["mean", "std", "variance", "min", "max", "median", "mode",
+             "range", "allowed_values", "value_range", "correlation"]
+
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
     global last_debug_info
@@ -371,9 +374,8 @@ async def answer_audio(request: Request):
         mime = "audio/wav"
     last_debug_info["detected_mime"] = mime
 
-    # NOTE: Gemini's REST API requires camelCase JSON keys — "inlineData" and
-    # "mimeType" — not snake_case. snake_case keys are silently dropped, so the
-    # audio part never actually reaches the model (this was the Q6 bug).
+    # Gemini's REST API requires camelCase JSON keys — "inlineData"/"mimeType" —
+    # not snake_case (snake_case keys get silently dropped).
     gemini_payload = {
         "contents": [{
             "parts": [
@@ -391,10 +393,11 @@ async def answer_audio(request: Request):
     transcript = await gemini_transcribe(gemini_payload)
     last_debug_info["transcript"] = transcript
 
+    empty = {"rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
+             "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
+             "allowed_values": {}, "value_range": {}, "correlation": []}
+
     if not transcript:
-        empty = {"rows": 0, "columns": [], "mean": {}, "std": {}, "variance": {},
-                 "min": {}, "max": {}, "median": {}, "mode": {}, "range": {},
-                 "allowed_values": {}, "value_range": {}, "correlation": []}
         return JSONResponse(empty)
 
     parse_prompt = f"""다음은 한국어 오디오 전사본입니다:
@@ -417,9 +420,15 @@ Return JSON with EXACTLY these keys:
   "range": {{"컬럼명": value}},
   "allowed_values": {{"컬럼명": ["값1", "값2"]}},
   "value_range": {{"컬럼명": [min, max]}},
-  "correlation": [[col1, col2, value]]
+  "correlation": [[col1, col2, value]],
+  "requested_stats": ["<only the stat names ACTUALLY mentioned or asked about in the transcript, chosen from: mean, std, variance, min, max, median, mode, range, allowed_values, value_range, correlation>"]
 }}
-Empty dict or empty list if not mentioned."""
+IMPORTANT: "requested_stats" must list ONLY the statistics that the transcript
+explicitly states or asks for. Do NOT include a stat in requested_stats (or in
+its corresponding key above) just because you could compute or infer it — for
+example, do NOT emit allowed_values unless the transcript explicitly lists a
+fixed set of permitted values for a column (e.g. "column is one of A, B, C").
+Empty dict/list for anything not mentioned."""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -429,23 +438,33 @@ Empty dict or empty list if not mentioned."""
         last_debug_info["parse_error"] = str(e)
         out = {}
 
-    result = {
-        "rows": int(out.get("rows", 0) or 0),
-        "columns": out.get("columns", []),
-        "mean": out.get("mean", {}),
-        "std": out.get("std", {}),
-        "variance": out.get("variance", {}),
-        "min": out.get("min", {}),
-        "max": out.get("max", {}),
-        "median": out.get("median", {}),
-        "mode": out.get("mode", {}),
-        "range": out.get("range", {}),
-        "allowed_values": out.get("allowed_values", {}),
-        "value_range": out.get("value_range", {}),
-        "correlation": out.get("correlation", [])
-    }
+    requested_stats = out.get("requested_stats") or []
+    last_debug_info["requested_stats"] = requested_stats
 
-    audio_history.append({"audio_id": audio_id, "transcript": transcript, "answer": result})
+    result = dict(empty)
+    result["rows"] = int(out.get("rows", 0) or 0)
+    result["columns"] = out.get("columns", []) or []
+
+    for stat in ALL_STATS:
+        if requested_stats and stat in requested_stats:
+            val = out.get(stat)
+            if stat == "correlation":
+                result[stat] = val if isinstance(val, list) else []
+            else:
+                result[stat] = val if isinstance(val, dict) else {}
+
+    if not requested_stats:
+        for stat in ALL_STATS:
+            val = out.get(stat)
+            if stat == "correlation":
+                if isinstance(val, list) and val:
+                    result[stat] = val
+            else:
+                if isinstance(val, dict) and val:
+                    result[stat] = val
+
+    audio_history.append({"audio_id": audio_id, "transcript": transcript,
+                           "requested_stats": requested_stats, "answer": result})
     if len(audio_history) > 50:
         del audio_history[0]
 
