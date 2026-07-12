@@ -349,7 +349,7 @@ async def answer_audio(request: Request):
     body = await request.json()
     audio_id = body.get("audio_id", "")
     audio_b64 = body.get("audio_base64", "")
-    last_debug_info = {"body_id": audio_id, "audio_b64_len": len(audio_b64)}
+    last_debug_info = {"body_id": audio_id}
 
     try:
         raw = base64.b64decode(audio_b64[:20])
@@ -360,7 +360,6 @@ async def answer_audio(request: Request):
         else: mime = "audio/wav"
     except Exception:
         mime = "audio/wav"
-    last_debug_info["detected_mime"] = mime
 
     gemini_payload = {
         "contents": [{
@@ -368,10 +367,9 @@ async def answer_audio(request: Request):
                 {"inlineData": {"mimeType": mime, "data": audio_b64}},
                 {"text": (
                     "이 오디오를 정확히 전사해 주세요. "
-                    "컬럼명은 반드시 오디오에서 들리는 그대로 한국어로 써주세요. "
-                    "영어로 번역하지 마세요. "
-                    "숫자도 정확히 그대로 써주세요. "
-                    "컬럼명에 포함된 숫자(예: 점수1, 점수2)는 띄어쓰기 없이 붙여서 표기하세요."
+                    "숫자와 컬럼명을 정확히 써주세요. "
+                    "컬럼명은 한국어 그대로, 영어 번역 금지. "
+                    "컬럼명 숫자는 붙여쓰기(점수1, 점수2)."
                 )}
             ]
         }]
@@ -390,28 +388,32 @@ async def answer_audio(request: Request):
     parse_prompt = f"""다음은 한국어 오디오 전사본입니다:
 {transcript}
 
-위 전사본에서 데이터셋 통계를 추출하세요.
-컬럼명은 반드시 전사본에 나온 그대로 한국어로 사용하세요. 영어로 바꾸지 마세요.
-컬럼명에 숫자가 붙는 경우(예: 점수1, 점수2) 띄어쓰기 없이 붙여서 사용하세요.
+아래 JSON 형식으로 정확히 추출하세요.
 
-CRITICAL: "rows" = 행의 수 (number of rows). 통계값과 혼동하지 마세요.
-숫자가 "개" 뒤에 오면 rows입니다. 예: "95개" = rows: 95
-통계값(평균 등)은 별도로 추출하세요. 예: "평균은 70" = mean: 70
-CRITICAL: "requested_stats" = 전사본에서 명시적으로 언급된 통계만. 한국어로 써주세요.
-예: 평균이 언급되면 "평균", 표준편차가 언급되면 "표준편차"
+규칙:
+1. "rows": 행의 수 (숫자 뒤에 "개" 또는 "행"이 오면 rows)
+2. "columns": 실제 데이터 컬럼명만 (통계 용어 절대 포함 금지)
+   - 통계 용어: 평균, 표준편차, 분산, 최솟값, 최댓값, 중앙값, 최빈값, 범위, 상관관계
+   - "점수1과 점수2" → columns: ["점수1", "점수2"] (과/와/의 기준으로 분리)
+3. "requested_stats": 전사본에서 명시적으로 언급된 통계만 한국어로
+   - 평균=mean, 표준편차=std, 분산=variance, 최솟값=min, 최댓값=max
+   - 중앙값=median, 최빈값=mode, 범위=range
+4. 각 통계값은 언급된 경우만 채우고, 나머지는 빈 dict {{}}
+5. allowed_values, value_range: 항상 {{}}
+6. correlation: 항상 []
 
 Return JSON:
 {{
   "rows": <integer>,
-  "columns": [<컬럼명만>],
-  "mean": {{"컬럼명": value}},
-  "std": {{"컬럼명": value}},
-  "variance": {{"컬럼명": value}},
-  "min": {{"컬럼명": value}},
-  "max": {{"컬럼명": value}},
-  "median": {{"컬럼명": value}},
-  "mode": {{"컬럼명": value}},
-  "range": {{"컬럼명": value}},
+  "columns": ["컬럼1", "컬럼2"],
+  "mean": {{"컬럼1": value, "컬럼2": value}},
+  "std": {{}},
+  "variance": {{}},
+  "min": {{}},
+  "max": {{}},
+  "median": {{}},
+  "mode": {{}},
+  "range": {{}},
   "allowed_values": {{}},
   "value_range": {{}},
   "correlation": [],
@@ -426,15 +428,23 @@ Return JSON:
         last_debug_info["parse_error"] = str(e)
         out = {}
 
-    # Korean → English
     requested_stats_raw = out.get("requested_stats") or []
     requested_stats = list({KO_TO_EN.get(s.strip(), s.strip()) for s in requested_stats_raw})
     last_debug_info["requested_stats"] = requested_stats
 
     result = dict(empty)
     result["rows"] = int(out.get("rows", 0) or 0)
-    raw_cols = [_norm_col(c) for c in (out.get("columns", []) or [])]
-    result["columns"] = _filter_columns(raw_cols)
+
+    # Columns — "과/와/의" split karo
+    raw_cols = out.get("columns", []) or []
+    split_cols = []
+    for c in raw_cols:
+        if re.search(r'[과와]', c):
+            parts = re.split(r'[과와]', c)
+            split_cols.extend([p.strip() for p in parts if p.strip()])
+        else:
+            split_cols.append(_norm_col(c))
+    result["columns"] = _filter_columns(split_cols)
 
     def _get_stat(stat):
         val = out.get(stat)
