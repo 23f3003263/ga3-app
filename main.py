@@ -145,7 +145,6 @@ async def extract(request: Request):
     except Exception:
         body = {}
 
-    # Q3: invoice_text field
     if "invoice_text" in body:
         text = body.get("invoice_text", "") or ""
 
@@ -196,7 +195,6 @@ Invoice text:
 
         return JSONResponse(result)
 
-    # ===== Q7: document_id + text + schema =====
     text = body.get("text", "")
     schema = body.get("schema", {})
     document_id = body.get("document_id", "")
@@ -355,6 +353,20 @@ Text:
 ALL_STATS = ["mean", "std", "variance", "min", "max", "median", "mode",
              "range", "allowed_values", "value_range", "correlation"]
 
+def _norm_col(name):
+    """Collapse a stray space Gemini inserts between a Korean word and a
+    trailing number: '점수 1' -> '점수1'. Also strips leading/trailing spaces."""
+    if not isinstance(name, str):
+        return name
+    s = name.strip()
+    s = re.sub(r'(\S)\s+(\d+)$', r'\1\2', s)
+    return s
+
+def _norm_keys(d):
+    if not isinstance(d, dict):
+        return d
+    return {_norm_col(k): v for k, v in d.items()}
+
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
     global last_debug_info
@@ -374,8 +386,6 @@ async def answer_audio(request: Request):
         mime = "audio/wav"
     last_debug_info["detected_mime"] = mime
 
-    # Gemini's REST API requires camelCase JSON keys — "inlineData"/"mimeType" —
-    # not snake_case (snake_case keys get silently dropped).
     gemini_payload = {
         "contents": [{
             "parts": [
@@ -384,7 +394,8 @@ async def answer_audio(request: Request):
                     "이 오디오를 정확히 전사해 주세요. "
                     "컬럼명은 반드시 오디오에서 들리는 그대로 한국어로 써주세요. "
                     "영어로 번역하지 마세요. "
-                    "숫자도 정확히 그대로 써주세요."
+                    "숫자도 정확히 그대로 써주세요. "
+                    "컬럼명에 포함된 숫자(예: 점수1, 점수2)는 띄어쓰기 없이 붙여서 표기하세요."
                 )}
             ]
         }]
@@ -405,11 +416,12 @@ async def answer_audio(request: Request):
 
 위 전사본에서 데이터셋 통계를 추출하세요.
 컬럼명은 반드시 전사본에 나온 그대로 한국어로 사용하세요. 영어로 바꾸지 마세요.
+컬럼명에 숫자가 붙는 경우(예: 점수1, 점수2) 띄어쓰기 없이 붙여서 사용하세요.
 
 Return JSON with EXACTLY these keys:
 {{
   "rows": <integer>,
-  "columns": [<컬럼명을 한국어 그대로>],
+  "columns": [<컬럼명을 한국어 그대로, 숫자는 붙여쓰기>],
   "mean": {{"컬럼명": value}},
   "std": {{"컬럼명": value}},
   "variance": {{"컬럼명": value}},
@@ -424,11 +436,10 @@ Return JSON with EXACTLY these keys:
   "requested_stats": ["<only the stat names ACTUALLY mentioned or asked about in the transcript, chosen from: mean, std, variance, min, max, median, mode, range, allowed_values, value_range, correlation>"]
 }}
 IMPORTANT: "requested_stats" must list ONLY the statistics that the transcript
-explicitly states or asks for. Do NOT include a stat in requested_stats (or in
-its corresponding key above) just because you could compute or infer it — for
-example, do NOT emit allowed_values unless the transcript explicitly lists a
-fixed set of permitted values for a column (e.g. "column is one of A, B, C").
-Empty dict/list for anything not mentioned."""
+explicitly states or asks for. Do NOT include a stat just because you could
+compute or infer it — e.g. do NOT emit allowed_values unless the transcript
+explicitly lists a fixed set of permitted values for a column. Empty dict/list
+for anything not mentioned."""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -443,25 +454,26 @@ Empty dict/list for anything not mentioned."""
 
     result = dict(empty)
     result["rows"] = int(out.get("rows", 0) or 0)
-    result["columns"] = out.get("columns", []) or []
+    result["columns"] = [_norm_col(c) for c in (out.get("columns", []) or [])]
+
+    def _get_stat(stat):
+        val = out.get(stat)
+        if stat == "correlation":
+            return val if isinstance(val, list) else []
+        if stat == "value_range" or stat == "allowed_values":
+            v = _norm_keys(val) if isinstance(val, dict) else {}
+            return v
+        return _norm_keys(val) if isinstance(val, dict) else {}
 
     for stat in ALL_STATS:
         if requested_stats and stat in requested_stats:
-            val = out.get(stat)
-            if stat == "correlation":
-                result[stat] = val if isinstance(val, list) else []
-            else:
-                result[stat] = val if isinstance(val, dict) else {}
+            result[stat] = _get_stat(stat)
 
     if not requested_stats:
         for stat in ALL_STATS:
-            val = out.get(stat)
-            if stat == "correlation":
-                if isinstance(val, list) and val:
-                    result[stat] = val
-            else:
-                if isinstance(val, dict) and val:
-                    result[stat] = val
+            v = _get_stat(stat)
+            if (stat == "correlation" and v) or (stat != "correlation" and v):
+                result[stat] = v
 
     audio_history.append({"audio_id": audio_id, "transcript": transcript,
                            "requested_stats": requested_stats, "answer": result})
