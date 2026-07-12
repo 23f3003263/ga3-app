@@ -199,7 +199,9 @@ Invoice text:
             return None
         try:
             if type_str == "string":
-                return str(value)
+                s = str(value)
+                # email fields lowercase karo
+                return s.lower() if "email" in str(value).lower() or "@" in s else s
             if type_str == "integer":
                 return int(float(re.sub(r'[^\d.-]', '', str(value))))
             if type_str in ("float", "number"):
