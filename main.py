@@ -448,7 +448,27 @@ Return JSON with EXACTLY these keys:
         last_debug_info["parse_error"] = str(e)
         out = {}
 
-    requested_stats = out.get("requested_stats") or []
+    requested_stats_raw = out.get("requested_stats") or []
+
+# Korean → English mapping
+ko_to_en = {
+    "평균": "mean", "표준편차": "std", "분산": "variance",
+    "최솟값": "min", "최소": "min", "최댓값": "max", "최대": "max",
+    "중앙값": "median", "중간값": "median", "최빈값": "mode",
+    "범위": "range", "허용값": "allowed_values",
+    "값의범위": "value_range", "상관관계": "correlation",
+    # English already
+    "mean": "mean", "std": "std", "variance": "variance",
+    "min": "min", "max": "max", "median": "median", "mode": "mode",
+    "range": "range", "allowed_values": "allowed_values",
+    "value_range": "value_range", "correlation": "correlation",
+}
+
+requested_stats = []
+for s in requested_stats_raw:
+    en = ko_to_en.get(s.strip(), s.strip())
+    if en not in requested_stats:
+        requested_stats.append(en)
     last_debug_info["requested_stats"] = requested_stats
 
     # Start with all empty
