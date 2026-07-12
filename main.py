@@ -58,6 +58,7 @@ async def gemini_transcribe(payload, attempts_per_model=3):
                         headers={"Authorization": f"Bearer {config.AIPIPE_TOKEN}"},
                         json=payload)
                     if r.status_code in (429, 500, 502, 503, 504):
+                        last_err = f"HTTP {r.status_code} on {model}"
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     r.raise_for_status()
@@ -66,6 +67,7 @@ async def gemini_transcribe(payload, attempts_per_model=3):
                     last_debug_info["transcribe_model"] = model
                     return txt
                 except (KeyError, IndexError):
+                    last_err = f"empty candidates on {model}"
                     break
                 except Exception as e:
                     last_err = str(e)[:160]
@@ -276,20 +278,33 @@ def coerce_type(value, expected_type):
     et = str(expected_type).lower().strip()
     try:
         if et == "string":
-            return str(value)
+            return str(value).strip().rstrip(".").strip()
         if et == "integer":
-            return int(float(str(value).replace(",", "")))
+            return int(round(float(str(value).replace(",", ""))))
         if et in ("float", "number"):
             return float(str(value).replace(",", ""))
         if et == "date":
             s = str(value).strip()
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
                 return s
+            try:
+                from datetime import datetime
+                for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d %B %Y", "%B %d, %Y", "%B %d %Y"):
+                    try:
+                        return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
             return s or None
         if et == "boolean":
             if isinstance(value, bool):
                 return value
             return str(value).strip().lower() in ("true", "yes", "1")
+        if et.startswith("array"):
+            if isinstance(value, list):
+                return value
+            return [value]
         return value
     except (ValueError, TypeError):
         return None
@@ -320,13 +335,15 @@ Fields to extract (name: type):
 Rules:
 - "date" type fields must be ISO format YYYY-MM-DD
 - "integer" and "float" type fields must be plain numbers, not strings
-- "string" type fields should be the exact text as written
+- "string" type fields should be the exact SHORTEST value (e.g. just the name, not a full sentence)
+- "boolean" type fields must be true or false
 
 Text:
 {text}"""
 
     try:
         out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
+        last_debug_info["q4_raw_llm_out"] = out
         for key, expected_type in schema.items():
             result[key] = coerce_type(out.get(key), expected_type)
     except Exception as e:
@@ -341,22 +358,26 @@ async def answer_audio(request: Request):
     body = await request.json()
     audio_id = body.get("audio_id", "")
     audio_b64 = body.get("audio_base64", "")
-    last_debug_info = {"body_id": audio_id}
+    last_debug_info = {"body_id": audio_id, "audio_b64_len": len(audio_b64)}
 
     try:
         raw = base64.b64decode(audio_b64[:20])
         if raw[:4] == b'RIFF': mime = "audio/wav"
         elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb': mime = "audio/mp3"
         elif raw[:4] == b'fLaC': mime = "audio/flac"
+        elif raw[:4] == b'OggS': mime = "audio/ogg"
         else: mime = "audio/wav"
-    except:
+    except Exception:
         mime = "audio/wav"
     last_debug_info["detected_mime"] = mime
 
+    # NOTE: Gemini's REST API requires camelCase JSON keys — "inlineData" and
+    # "mimeType" — not snake_case. snake_case keys are silently dropped, so the
+    # audio part never actually reaches the model (this was the Q6 bug).
     gemini_payload = {
         "contents": [{
             "parts": [
-                {"inline_data": {"mime_type": mime, "data": audio_b64}},
+                {"inlineData": {"mimeType": mime, "data": audio_b64}},
                 {"text": (
                     "이 오디오를 정확히 전사해 주세요. "
                     "컬럼명은 반드시 오디오에서 들리는 그대로 한국어로 써주세요. "
@@ -394,7 +415,7 @@ Return JSON with EXACTLY these keys:
   "median": {{"컬럼명": value}},
   "mode": {{"컬럼명": value}},
   "range": {{"컬럼명": value}},
-  "allowed_values": {{}},
+  "allowed_values": {{"컬럼명": ["값1", "값2"]}},
   "value_range": {{"컬럼명": [min, max]}},
   "correlation": [[col1, col2, value]]
 }}
@@ -409,7 +430,7 @@ Empty dict or empty list if not mentioned."""
         out = {}
 
     result = {
-        "rows": int(out.get("rows", 0)),
+        "rows": int(out.get("rows", 0) or 0),
         "columns": out.get("columns", []),
         "mean": out.get("mean", {}),
         "std": out.get("std", {}),
@@ -419,7 +440,7 @@ Empty dict or empty list if not mentioned."""
         "median": out.get("median", {}),
         "mode": out.get("mode", {}),
         "range": out.get("range", {}),
-        "allowed_values": {},
+        "allowed_values": out.get("allowed_values", {}),
         "value_range": out.get("value_range", {}),
         "correlation": out.get("correlation", [])
     }
