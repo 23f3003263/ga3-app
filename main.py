@@ -321,7 +321,7 @@ Use empty dict or empty list if not mentioned."""
         "median": out.get("median", {}),
         "mode": out.get("mode", {}),
         "range": out.get("range", {}),
-        "allowed_values": out.get("allowed_values", {}),
+        "allowed_values": {}),
         "value_range": out.get("value_range", {}),
         "correlation": out.get("correlation", [])
     }
