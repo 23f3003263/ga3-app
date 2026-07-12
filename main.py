@@ -169,6 +169,8 @@ Invoice text:
     text = body.get("text", "")
     schema = body.get("schema", {})
     document_id = body.get("document_id", "")
+    last_debug_info["q7_text"] = text[:500]
+    last_debug_info["q7_schema"] = schema
 
     prompt = f"""You are a precise data extraction assistant.
 
