@@ -1,5 +1,4 @@
-import json, re, base64, hashlib
-from statistics import mean, median, pstdev, pvariance, mode
+import json, re, base64, hashlib, math, asyncio
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,14 +10,25 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
     allow_headers=["*"], allow_credentials=False,
 )
+
 HEAD = {"Authorization": f"Bearer {config.AIPIPE_TOKEN}",
         "Content-Type": "application/json"}
 _CACHE = {}
+last_debug_info = {}
+audio_history = []
 
 def _ck(*parts):
     return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
 
-import asyncio
+def parse_json(s):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"\{.*\}", s, re.DOTALL)
+        return json.loads(m.group(0)) if m else {}
 
 async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
     key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
@@ -44,8 +54,6 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
     raise RuntimeError(f"chat failed: {last_err}")
 
 GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
-last_debug_info = {}
-audio_history = []
 
 async def gemini_transcribe(payload, attempts_per_model=3):
     global last_debug_info
@@ -74,19 +82,13 @@ async def gemini_transcribe(payload, attempts_per_model=3):
     last_debug_info["transcribe_error"] = last_err
     return ""
 
-def parse_json(s):
-    s = s.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```[a-z]*\n?|\n?```$", "", s).strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        m = re.search(r"\{.*\}", s, re.DOTALL)
-        return json.loads(m.group(0)) if m else {}
-
 @app.get("/")
 async def root():
     return {"ok": True, "email": config.EMAIL}
+
+@app.get("/debug")
+async def debug():
+    return {"last": last_debug_info, "history": audio_history[-5:]}
 
 # ===== Q2: /answer-image =====
 def normalize_answer(ans):
@@ -136,29 +138,30 @@ async def answer_image(request: Request):
 async def extract(request: Request):
     body = await request.json()
 
-    # Q3: invoice fixed schema
+    # Q3: fixed invoice schema
     if "invoice_text" in body:
         text = body["invoice_text"]
-        prompt = f"""Extract invoice fields. Return JSON with EXACTLY these keys:
-invoice_no, vendor, currency (ISO 4217), total_amount (integer), invoice_date (YYYY-MM-DD),
-due_in_days (integer), is_paid (boolean), priority (low/normal/high/urgent),
-contact_email (lowercase), line_items (array of {{sku, quantity, unit_price integer}}), item_count (integer).
+        prompt = f"""Extract invoice fields from the text below.
+Return JSON with EXACTLY these keys (no extras, no missing):
+invoice_no, vendor, currency, total_amount, invoice_date, due_in_days, is_paid, priority, contact_email, line_items, item_count
 
 Rules:
-- invoice_no: invoice number/ID as string (e.g. "INV-1234")
-- currency: convert symbols to ISO code (₹=INR, $=USD, €=EUR, £=GBP)
-- total_amount: integer only (12K=12000, "twelve thousand"=12000)
-- due_in_days: integer ("Net 30"=30, "two weeks"=14)
+- invoice_no: invoice number as string, null if not found
+- vendor: biller name exactly as written
+- currency: ISO 4217 code (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
+- total_amount: integer (strip decimals, 12K=12000, words like "twelve thousand"=12000)
+- invoice_date: YYYY-MM-DD
+- due_in_days: integer ("Net 30"=30, "two weeks"=14, "45 days"=45)
 - is_paid: true if paid/cleared, false if pending/awaiting
-- priority: infer from urgency (URGENT/ASAP=urgent, high priority=high, else normal)
-- line_items: in order they appear
-- item_count: count of line_items
-- Use null if field not found
+- priority: one of low/normal/high/urgent
+- contact_email: lowercase string
+- line_items: array of objects with keys sku, quantity (int), unit_price (int)
+- item_count: integer count of line_items
 
-Invoice:
+Invoice text:
 {text}"""
         try:
-            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=1200))
+            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=1500))
             out["total_amount"] = int(float(str(out.get("total_amount", 0)).replace(",", "")))
             out["due_in_days"] = int(out.get("due_in_days", 0))
             out["is_paid"] = bool(out.get("is_paid", False))
@@ -170,6 +173,7 @@ Invoice:
             return JSONResponse(out)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
     # Q7: dynamic schema
     text = body.get("text", "")
     schema = body.get("schema", {})
@@ -177,40 +181,51 @@ Invoice:
     from datetime import datetime
 
     def coerce(value, type_str):
-        if value is None: return None
+        if value is None:
+            return None
         try:
-            if type_str == "string": return str(value)
-            if type_str == "integer": return int(float(re.sub(r'[^\d.-]','',str(value))))
-            if type_str == "float": return float(re.sub(r'[^\d.-]','',str(value)))
+            if type_str == "string":
+                return str(value)
+            if type_str == "integer":
+                return int(float(re.sub(r'[^\d.-]', '', str(value))))
+            if type_str == "float":
+                return float(re.sub(r'[^\d.-]', '', str(value)))
             if type_str == "boolean":
-                if isinstance(value, bool): return value
-                return str(value).lower() in ("true","1","yes")
+                if isinstance(value, bool):
+                    return value
+                return str(value).lower() in ("true", "1", "yes")
             if type_str == "date":
                 s = str(value).strip()
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", s): return s
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                    return s
                 s2 = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', s).strip()
-                for fmt in ["%d %B %Y","%d %b %Y","%B %d %Y","%d/%m/%Y","%m/%d/%Y"]:
+                for fmt in ["%d %B %Y", "%d %b %Y", "%B %d %Y",
+                            "%d/%m/%Y", "%m/%d/%Y"]:
                     for src in (s2, s):
-                        try: return datetime.strptime(src, fmt).strftime("%Y-%m-%d")
-                        except: pass
+                        try:
+                            return datetime.strptime(src, fmt).strftime("%Y-%m-%d")
+                        except:
+                            pass
                 return s
             if type_str == "array[string]":
                 return [str(v) for v in value] if isinstance(value, list) else [str(value)]
             if type_str == "array[integer]":
                 return [int(float(str(v))) for v in value] if isinstance(value, list) else [int(float(str(value)))]
-        except: pass
+        except:
+            pass
         return None
 
-    prompt = f"""Extract fields from text. Return ONLY valid JSON with EXACTLY these keys:
+    prompt = f"""Extract fields from the text. Return ONLY valid JSON with EXACTLY these keys:
 {json.dumps(schema, indent=2)}
 
 Rules:
 - Use null if field not found
-- Numbers = JSON numbers (not strings)
-- Dates = YYYY-MM-DD
+- Numbers must be JSON numbers (not strings)
+- Dates must be YYYY-MM-DD
 - No extra keys, no missing keys
 
-Text: {text}"""
+Text:
+{text}"""
 
     try:
         raw = await chat([{"role": "user", "content": prompt}], max_tokens=1024)
@@ -220,7 +235,7 @@ Text: {text}"""
 
     return JSONResponse({k: coerce(extracted.get(k), v) for k, v in schema.items()})
 
-# ===== Q4: /answer-audio (Korean audio stats) =====
+# ===== Q4: /answer-audio =====
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
     global last_debug_info
@@ -229,13 +244,16 @@ async def answer_audio(request: Request):
     audio_b64 = body.get("audio_base64", "")
     last_debug_info = {"body_id": audio_id}
 
-    # Detect mime type
     try:
         raw = base64.b64decode(audio_b64[:20])
-        if raw[:4] == b'RIFF': mime = "audio/wav"
-        elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb': mime = "audio/mp3"
-        elif raw[:4] == b'fLaC': mime = "audio/flac"
-        else: mime = "audio/wav"
+        if raw[:4] == b'RIFF':
+            mime = "audio/wav"
+        elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb':
+            mime = "audio/mp3"
+        elif raw[:4] == b'fLaC':
+            mime = "audio/flac"
+        else:
+            mime = "audio/wav"
     except:
         mime = "audio/wav"
     last_debug_info["detected_mime"] = mime
@@ -247,8 +265,7 @@ async def answer_audio(request: Request):
                 {"text": (
                     "이 오디오를 한국어로 전사해 주세요. "
                     "오디오에 데이터셋이나 통계 정보가 포함되어 있으면 "
-                    "숫자와 컬럼명을 정확히 추출해 주세요. "
-                    "전사 결과를 그대로 출력해 주세요."
+                    "숫자와 컬럼명을 정확히 추출해 주세요."
                 )}
             ]
         }]
@@ -263,14 +280,13 @@ async def answer_audio(request: Request):
                  "allowed_values": {}, "value_range": {}, "correlation": []}
         return JSONResponse(empty)
 
-    # Parse transcript with LLM
     parse_prompt = f"""Korean audio transcript:
 {transcript}
 
-Extract dataset statistics. Return JSON:
+Extract dataset statistics. Return JSON with EXACTLY these keys:
 {{
   "rows": <integer>,
-  "columns": [<column names>],
+  "columns": [<column names as strings>],
   "mean": {{"col": value}},
   "std": {{"col": value}},
   "variance": {{"col": value}},
@@ -283,8 +299,7 @@ Extract dataset statistics. Return JSON:
   "value_range": {{"col": [min, max]}},
   "correlation": [[col1, col2, value]]
 }}
-
-Use empty dict/list if not mentioned."""
+Use empty dict or empty list if not mentioned."""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -316,10 +331,6 @@ Use empty dict/list if not mentioned."""
 
     return JSONResponse(result)
 
-@app.get("/debug")
-async def debug():
-    return {"last": last_debug_info, "history": audio_history[-5:]}
-
 # ===== Q8: /rank =====
 @app.post("/rank")
 async def rank(request: Request):
@@ -332,7 +343,6 @@ async def rank(request: Request):
                                "input": [query] + list(candidates)})
         r.raise_for_status()
         vecs = [d["embedding"] for d in r.json()["data"]]
-    import math
     q = vecs[0]
     cand = vecs[1:]
     def cos(a, b):
@@ -354,7 +364,8 @@ async def solve(request: Request):
         "1. List relevant vs distractor numbers.\n"
         "2. Do arithmetic one step at a time.\n"
         "3. Double-check before finalising.\n"
-        "Return JSON with EXACTLY: 'reasoning' (string >=80 chars) and 'answer' (integer).\n\n"
+        "Return JSON with EXACTLY two keys: "
+        "'reasoning' (string >=80 chars) and 'answer' (integer, not string).\n\n"
         f"PROBLEM:\n{problem}"
     )
     try:
@@ -366,4 +377,4 @@ async def solve(request: Request):
             reasoning = (reasoning + " Step-by-step arithmetic applied; distractors ignored.").strip()
         return {"reasoning": reasoning, "answer": ans}
     except Exception as e:
-        return {"reasoning": ("Error solving: " + str(e)).ljust(80), "answer": 0}
+        return {"reasoning": ("Error: " + str(e)).ljust(80), "answer": 0}
