@@ -233,25 +233,28 @@ Invoice text:
         field_desc.append(f"- {k} ({t}){': ' + desc if desc else ''}")
     field_list = "\n".join(field_desc)
 
-    prompt = f"""Extract the following fields from the invoice/document text below.
+    prompt = f"""Extract the following fields from the document text below.
 
 Fields to extract:
 {field_list}
 
-IMPORTANT RULES:
+CRITICAL RULES:
 - Return a flat JSON object with EXACTLY these keys: {list(props.keys())}
 - currency: MUST be ISO 4217 code only ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥=JPY)
 - email fields: must be lowercase
 - dates: YYYY-MM-DD format
 - numbers: JSON numbers not strings
-- line_items: extract ALL product/item rows as array of objects with sku, quantity, unit_price
-- arrays: use empty array [] if nothing found, never null
-- boolean: true or false only
-- Use null only for missing non-array fields
+- line_items: MUST be a JSON array of objects. Each product/item row in the text = one object with keys:
+  * sku: product code or name (string)
+  * quantity: how many units (integer)
+  * unit_price: price per unit (integer)
+  Extract ALL items. Example: [{{"sku":"ABC-123","quantity":5,"unit_price":100}}]
+- All array fields: use empty array [] if nothing found, NEVER null or {{}}
+- boolean fields: true or false only
+- Use null only for missing non-array string/number fields
 
-TEXT:
+DOCUMENT TEXT:
 {text}"""
-
     try:
         raw = await chat([{"role": "user", "content": prompt}],
                          model="gpt-4o", max_tokens=1500)
