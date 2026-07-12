@@ -227,7 +227,7 @@ Text:
 {text}"""
 
     try:
-        raw = await chat([{"role": "user", "content": prompt}], max_tokens=1024)
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=512)
         extracted = parse_json(raw)
     except:
         extracted = {}
