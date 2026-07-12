@@ -249,6 +249,8 @@ Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
 - Numbers must be JSON numbers not strings
 - email fields must be lowercase
 - currency fields must be ISO 4217 code ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥ or yen=JPY)
+- line_items: extract ALL items/products listed in the text as array of objects with sku, quantity, unit_price
+- array fields must never be null, use empty array [] if nothing found
 - No extra keys allowed"""
 
     try:
