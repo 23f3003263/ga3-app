@@ -263,13 +263,24 @@ DOCUMENT TEXT:
         extracted = {}
 
     result = {}
+    # line_items special handling
     for k, prop_def in props.items():
-        val = extracted.get(k)
-        coerced = coerce(k, val, prop_def)
-        # Arrays kabhi null nahi honge
-        if get_type(prop_def).startswith("array") and coerced is None:
-            coerced = []
-        result[k] = coerced
+        if k == "line_items" and (not result.get(k)):
+            # Dedicated line items extraction
+            items_prompt = f"""From this text, extract ALL product line items as a JSON array.
+Each item must have: sku (string), quantity (integer), unit_price (integer).
+Return ONLY a JSON object like: {{"line_items": [{{"sku":"X","quantity":1,"unit_price":10}}]}}
+
+TEXT:
+{text}"""
+            try:
+                items_raw = await chat([{"role": "user", "content": items_prompt}],
+                                      model="gpt-4o", max_tokens=800)
+                items_parsed = parse_json(items_raw)
+                if items_parsed.get("line_items"):
+                    result["line_items"] = items_parsed["line_items"]
+            except:
+                pass
 
     return JSONResponse(result)
 
