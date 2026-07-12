@@ -248,6 +248,7 @@ Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
 - Dates must be YYYY-MM-DD format
 - Numbers must be JSON numbers not strings
 - email fields must be lowercase
+- currency fields must be ISO 4217 code ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥ or yen=JPY)
 - No extra keys allowed"""
 
     try:
