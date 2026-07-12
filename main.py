@@ -353,9 +353,14 @@ Text:
 ALL_STATS = ["mean", "std", "variance", "min", "max", "median", "mode",
              "range", "allowed_values", "value_range", "correlation"]
 
+# Korean words for statistics — these must NEVER appear as column names.
+STAT_KEYWORDS_KO = [
+    "평균", "표준편차", "분산", "최솟값", "최댓값", "최소", "최대",
+    "중앙값", "중간값", "최빈값", "범위", "허용값", "허용된값",
+    "상관관계", "값의범위",
+]
+
 def _norm_col(name):
-    """Collapse a stray space Gemini inserts between a Korean word and a
-    trailing number: '점수 1' -> '점수1'. Also strips leading/trailing spaces."""
     if not isinstance(name, str):
         return name
     s = name.strip()
@@ -366,6 +371,15 @@ def _norm_keys(d):
     if not isinstance(d, dict):
         return d
     return {_norm_col(k): v for k, v in d.items()}
+
+def _is_stat_keyword(name):
+    if not isinstance(name, str):
+        return False
+    n = re.sub(r'\s+', '', name)
+    return n in STAT_KEYWORDS_KO
+
+def _filter_columns(cols):
+    return [c for c in cols if not _is_stat_keyword(c)]
 
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
@@ -395,7 +409,7 @@ async def answer_audio(request: Request):
                     "컬럼명은 반드시 오디오에서 들리는 그대로 한국어로 써주세요. "
                     "영어로 번역하지 마세요. "
                     "숫자도 정확히 그대로 써주세요. "
-                    "컬럼명에 포함된 숫자(예: 점수1, 점수2띄어쓰기 없이 붙여서 표기하세요."
+                    "컬럼명에 포함된 숫자(예: 점수1, 점수2)는 띄어쓰기 없이 붙여서 표기하세요."
                 )}
             ]
         }]
@@ -418,10 +432,18 @@ async def answer_audio(request: Request):
 컬럼명은 반드시 전사본에 나온 그대로 한국어로 사용하세요. 영어로 바꾸지 마세요.
 컬럼명에 숫자가 붙는 경우(예: 점수1, 점수2) 띄어쓰기 없이 붙여서 사용하세요.
 
+CRITICAL: "columns" must contain ONLY the actual data column names (e.g. 점수1,
+점수2, 나이, 소득). NEVER include a statistic word itself as a column name —
+words like 평균(mean), 표준편차(std), 분산(variance), 최솟값/최댓값(min/max),
+중앙값(median), 최빈값(mode), 범위(range), 상관관계(correlation), 허용값
+(allowed_values) are STATISTIC NAMES, not columns, even if they appear in the
+sentence "점수1과 점수2의 평균은 ..." — here 평균 is NOT a column, only
+점수1 and 점수2 are.
+
 Return JSON with EXACTLY these keys:
 {{
   "rows": <integer>,
-  "columns": [<컬럼명을 한국어 그대로, 숫자는 붙여쓰기>],
+  "columns": [<컬럼명을 한국어 그대로, 숫자는 붙여쓰기, 통계 용어 제외>],
   "mean": {{"컬럼명": value}},
   "std": {{"컬럼명": value}},
   "variance": {{"컬럼명": value}},
@@ -437,9 +459,7 @@ Return JSON with EXACTLY these keys:
 }}
 IMPORTANT: "requested_stats" must list ONLY the statistics that the transcript
 explicitly states or asks for. Do NOT include a stat just because you could
-compute or infer it — e.g. do NOT emit allowed_values unless the transcript
-explicitly lists a fixed set of permitted values for a column. Empty dict/list
-for anything not mentioned."""
+compute or infer it. Empty dict/list for anything not mentioned."""
 
     try:
         raw_llm = await chat([{"role": "user", "content": parse_prompt}], max_tokens=1500)
@@ -454,16 +474,16 @@ for anything not mentioned."""
 
     result = dict(empty)
     result["rows"] = int(out.get("rows", 0) or 0)
-    result["columns"] = [_norm_col(c) for c in (out.get("columns", []) or [])]
+    raw_cols = [_norm_col(c) for c in (out.get("columns", []) or [])]
+    result["columns"] = _filter_columns(raw_cols)
 
     def _get_stat(stat):
         val = out.get(stat)
         if stat == "correlation":
             return val if isinstance(val, list) else []
-        if stat == "value_range" or stat == "allowed_values":
-            v = _norm_keys(val) if isinstance(val, dict) else {}
-            return v
-        return _norm_keys(val) if isinstance(val, dict) else {}
+        v = _norm_keys(val) if isinstance(val, dict) else {}
+        # also strip any stat-keyword that slipped in as a dict key
+        return {k: vv for k, vv in v.items() if not _is_stat_keyword(k)}
 
     for stat in ALL_STATS:
         if requested_stats and stat in requested_stats:
