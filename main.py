@@ -269,6 +269,71 @@ Return a JSON object matching this schema exactly:
         last_debug_info["q7_error"] = str(e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
+# ===== Q4: /dynamic-extract =====
+def coerce_type(value, expected_type):
+    if value is None:
+        return None
+    et = str(expected_type).lower().strip()
+    try:
+        if et == "string":
+            return str(value)
+        if et == "integer":
+            return int(float(str(value).replace(",", "")))
+        if et in ("float", "number"):
+            return float(str(value).replace(",", ""))
+        if et == "date":
+            s = str(value).strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+                return s
+            return s or None
+        if et == "boolean":
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("true", "yes", "1")
+        return value
+    except (ValueError, TypeError):
+        return None
+
+@app.post("/dynamic-extract")
+async def dynamic_extract(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    text = body.get("text", "") or ""
+    schema = body.get("schema", {}) or {}
+
+    result = {k: None for k in schema.keys()}
+
+    if not text or not schema:
+        return JSONResponse(result)
+
+    field_desc = "\n".join(f'- "{k}": {v}' for k, v in schema.items())
+    prompt = f"""Extract the following fields from the text below. Return a JSON object
+with EXACTLY these keys, no extras, no missing keys. If a field cannot be found in
+the text, use null for that field.
+
+Fields to extract (name: type):
+{field_desc}
+
+Rules:
+- "date" type fields must be ISO format YYYY-MM-DD
+- "integer" and "float" type fields must be plain numbers, not strings
+- "string" type fields should be the exact text as written
+
+Text:
+{text}"""
+
+    try:
+        out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
+        for key, expected_type in schema.items():
+            result[key] = coerce_type(out.get(key), expected_type)
+    except Exception as e:
+        last_debug_info["q4_error"] = str(e)
+
+    return JSONResponse(result)
+
 # ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
