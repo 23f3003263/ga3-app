@@ -486,11 +486,19 @@ compute or infer it. Empty dict/list for anything not mentioned."""
         return {k: vv for k, vv in v.items() if not _is_stat_keyword(k)}
 
     for stat in ALL_STATS:
+        if stat == "allowed_values":
+            result[stat] = {}
+            continue
+        if stat == "value_range":
+            result[stat] = {}
+            continue
         if requested_stats and stat in requested_stats:
             result[stat] = _get_stat(stat)
 
     if not requested_stats:
         for stat in ALL_STATS:
+            if stat in ("allowed_values", "value_range"):
+                continue
             v = _get_stat(stat)
             if (stat == "correlation" and v) or (stat != "correlation" and v):
                 result[stat] = v
