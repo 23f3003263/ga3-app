@@ -333,7 +333,15 @@ def _is_stat_keyword(name):
     return re.sub(r'\s+', '', name) in STAT_KEYWORDS_KO
 
 def _filter_columns(cols):
-    return [c for c in cols if not _is_stat_keyword(c)]
+    filtered = []
+    for c in cols:
+        if _is_stat_keyword(c):
+            continue
+        # "과", "와", "의" wale compound names filter karo
+        if re.search(r'[과와의]', c):
+            continue
+        filtered.append(c)
+    return filtered
 
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
