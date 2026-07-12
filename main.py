@@ -140,24 +140,25 @@ async def extract(request: Request):
     if "invoice_text" in body:
         text = body["invoice_text"]
         prompt = f"""Extract invoice fields. Return JSON with EXACTLY these keys:
-vendor, currency (ISO 4217), total_amount (integer), invoice_date (YYYY-MM-DD),
+invoice_no, vendor, currency (ISO 4217), total_amount (integer), invoice_date (YYYY-MM-DD),
 due_in_days (integer), is_paid (boolean), priority (low/normal/high/urgent),
 contact_email (lowercase), line_items (array of {{sku, quantity, unit_price integer}}), item_count (integer).
 
 Rules:
+- invoice_no: invoice number/ID as string (e.g. "INV-1234")
 - currency: convert symbols to ISO code (₹=INR, $=USD, €=EUR, £=GBP)
-- total_amount: integer only, no decimals (12K=12000, words like "twelve thousand"=12000)
+- total_amount: integer only (12K=12000, "twelve thousand"=12000)
 - due_in_days: integer ("Net 30"=30, "two weeks"=14)
 - is_paid: true if paid/cleared, false if pending/awaiting
-- priority: infer from urgency words (URGENT/ASAP=urgent, high priority=high, normal otherwise)
+- priority: infer from urgency (URGENT/ASAP=urgent, high priority=high, else normal)
 - line_items: in order they appear
 - item_count: count of line_items
+- Use null if field not found
 
 Invoice:
 {text}"""
         try:
             out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=1200))
-            # Fix types
             out["total_amount"] = int(float(str(out.get("total_amount", 0)).replace(",", "")))
             out["due_in_days"] = int(out.get("due_in_days", 0))
             out["is_paid"] = bool(out.get("is_paid", False))
@@ -169,7 +170,6 @@ Invoice:
             return JSONResponse(out)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
-
     # Q7: dynamic schema
     text = body.get("text", "")
     schema = body.get("schema", {})
