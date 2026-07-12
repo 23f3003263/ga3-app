@@ -13,12 +13,8 @@ app.add_middleware(
 
 HEAD = {"Authorization": f"Bearer {config.AIPIPE_TOKEN}",
         "Content-Type": "application/json"}
-_CACHE = {}
 last_debug_info = {}
 audio_history = []
-
-def _ck(*parts):
-    return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
 
 def parse_json(s):
     s = s.strip()
@@ -31,9 +27,6 @@ def parse_json(s):
         return json.loads(m.group(0)) if m else {}
 
 async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
-    key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
-    if key in _CACHE:
-        return _CACHE[key]
     body = {"model": model or config.TEXT_MODEL, "messages": messages,
             "temperature": 0, "max_tokens": max_tokens}
     if force_json:
@@ -48,9 +41,7 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
             r.raise_for_status()
-            out = r.json()["choices"][0]["message"]["content"]
-            _CACHE[key] = out
-            return out
+            return r.json()["choices"][0]["message"]["content"]
     raise RuntimeError(f"chat failed: {last_err}")
 
 GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash"]
@@ -133,12 +124,12 @@ async def answer_image(request: Request):
         ans = ""
     return {"answer": str(ans)}
 
-# ===== Q3 + Q7: /extract =====
+# ===== Q3: /extract (invoice fixed schema) =====
 @app.post("/extract")
 async def extract(request: Request):
     body = await request.json()
 
-    # Q3: fixed invoice schema
+    # Q3: invoice_text field
     if "invoice_text" in body:
         text = body["invoice_text"]
         prompt = f"""Extract invoice fields from the text below.
@@ -148,14 +139,14 @@ invoice_no, vendor, currency, total_amount, invoice_date, due_in_days, is_paid, 
 Rules:
 - invoice_no: invoice number as string, null if not found
 - vendor: biller name exactly as written
-- currency: ISO 4217 code (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
+- currency: ISO 4217 code ONLY (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
 - total_amount: integer (12K=12000, "twelve thousand"=12000)
 - invoice_date: YYYY-MM-DD
 - due_in_days: integer ("Net 30"=30, "two weeks"=14)
 - is_paid: true if paid/cleared, false if pending/awaiting
 - priority: one of low/normal/high/urgent
 - contact_email: lowercase string, null if not found
-- line_items: array of objects with keys sku, quantity (int), unit_price (int)
+- line_items: array of objects with keys sku, quantity (int), unit_price (int). ALWAYS extract all items.
 - item_count: integer count of line_items
 
 Invoice text:
@@ -174,100 +165,110 @@ Invoice text:
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
-    # Q7: dynamic schema
+    # ===== Q7: dynamic schema (document_id + text + schema) =====
     text = body.get("text", "")
     schema = body.get("schema", {})
 
-    # Handle JSON Schema object
+    # JSON Schema → simple field list extract karo
+    props = {}
     if "properties" in schema:
-        props = schema.get("properties", {})
-        simple_schema = {}
-        for k, v in props.items():
-            t = v.get("type", "string")
-            if t == "number":
-                t = "float"
-            simple_schema[k] = t
-    else:
-        simple_schema = schema
-
+        props = schema["properties"]
+    
     from datetime import datetime
 
-    def coerce(value, type_str):
+    def get_type(prop_def):
+        t = prop_def.get("type", "string")
+        fmt = prop_def.get("format", "")
+        if fmt == "date": return "date"
+        if t == "number": return "float"
+        if t == "integer": return "integer"
+        if t == "boolean": return "boolean"
+        if t == "array":
+            items_type = prop_def.get("items", {}).get("type", "string")
+            return f"array[{items_type}]"
+        if t == "object": return "object"
+        return "string"
+
+    def coerce(key, value, prop_def):
         if value is None:
             return None
+        type_str = get_type(prop_def)
         try:
             if type_str == "string":
-                return str(value)
+                s = str(value)
+                if "email" in key.lower() or "@" in s:
+                    return s.lower()
+                return s
             if type_str == "integer":
                 return int(float(re.sub(r'[^\d.-]', '', str(value))))
-            if type_str in ("float", "number"):
+            if type_str == "float":
                 return float(re.sub(r'[^\d.-]', '', str(value)))
             if type_str == "boolean":
-                if isinstance(value, bool):
-                    return value
+                if isinstance(value, bool): return value
                 return str(value).lower() in ("true", "1", "yes")
             if type_str == "date":
                 s = str(value).strip()
-                if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-                    return s
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", s): return s
                 s2 = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', s).strip()
-                for fmt in ["%d %B %Y", "%d %b %Y", "%B %d %Y",
-                            "%d/%m/%Y", "%m/%d/%Y"]:
+                for fmt in ["%d %B %Y", "%d %b %Y", "%B %d %Y", "%d/%m/%Y", "%m/%d/%Y"]:
                     for src in (s2, s):
-                        try:
-                            return datetime.strptime(src, fmt).strftime("%Y-%m-%d")
-                        except:
-                            pass
+                        try: return datetime.strptime(src, fmt).strftime("%Y-%m-%d")
+                        except: pass
                 return s
             if type_str == "array[string]":
                 return [str(v) for v in value] if isinstance(value, list) else [str(value)]
             if type_str == "array[integer]":
                 return [int(float(str(v))) for v in value] if isinstance(value, list) else [int(float(str(value)))]
+            if type_str == "object":
+                return value
         except:
             pass
         return None
 
-    def coerce_field(k, value, type_str):
-        result = coerce(value, type_str)
-        # email fields hamesha lowercase
-        if isinstance(result, str) and ("email" in k.lower() or "@" in str(result)):
-            return result.lower()
-        return result
+    # Field descriptions for prompt
+    field_desc = []
+    for k, v in props.items():
+        t = get_type(v)
+        desc = v.get("description", "")
+        field_desc.append(f"- {k} ({t}){': ' + desc if desc else ''}")
+    field_list = "\n".join(field_desc)
 
-    field_list = "\n".join(f"- {k}: {v}" for k, v in simple_schema.items())
+    prompt = f"""Extract the following fields from the invoice/document text below.
 
-    prompt = f"""Read the text below and extract these fields:
-
+Fields to extract:
 {field_list}
 
-TEXT:
-{text}
+IMPORTANT RULES:
+- Return a flat JSON object with EXACTLY these keys: {list(props.keys())}
+- currency: MUST be ISO 4217 code only ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥=JPY)
+- email fields: must be lowercase
+- dates: YYYY-MM-DD format
+- numbers: JSON numbers not strings
+- line_items: extract ALL product/item rows as array of objects with sku, quantity, unit_price
+- arrays: use empty array [] if nothing found, never null
+- boolean: true or false only
+- Use null only for missing non-array fields
 
-Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
-- Use null if a field is not found in the text
-- Dates must be YYYY-MM-DD format
-- Numbers must be JSON numbers not strings
-- email fields must be lowercase
-- currency fields must be ISO 4217 code ($ or dollars=USD, £ or pounds=GBP, € or euros=EUR, ₹ or rupees=INR, ¥ or yen=JPY)
-- line_items: extract ALL items/products listed in the text as array of objects with sku, quantity, unit_price
-- array fields must never be null, use empty array [] if nothing found
-- No extra keys allowed"""
+TEXT:
+{text}"""
 
     try:
-        # Cache bypass - direct call
-        body_req = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0, "max_tokens": 512,
-                "response_format": {"type": "json_object"}}
-        async with httpx.AsyncClient(timeout=90) as c:
-            r = await c.post(f"{config.AIPIPE_BASE}/chat/completions",
-                             headers=HEAD, json=body_req)
-            r.raise_for_status()
-            raw = r.json()["choices"][0]["message"]["content"]
+        raw = await chat([{"role": "user", "content": prompt}],
+                         model="gpt-4o", max_tokens=1500)
         extracted = parse_json(raw)
     except:
         extracted = {}
 
-    return JSONResponse({k: coerce_field(k, extracted.get(k), v) for k, v in simple_schema.items()})
+    result = {}
+    for k, prop_def in props.items():
+        val = extracted.get(k)
+        coerced = coerce(k, val, prop_def)
+        # Arrays kabhi null nahi honge
+        if get_type(prop_def).startswith("array") and coerced is None:
+            coerced = []
+        result[k] = coerced
+
+    return JSONResponse(result)
 
 # ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
@@ -280,14 +281,10 @@ async def answer_audio(request: Request):
 
     try:
         raw = base64.b64decode(audio_b64[:20])
-        if raw[:4] == b'RIFF':
-            mime = "audio/wav"
-        elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb':
-            mime = "audio/mp3"
-        elif raw[:4] == b'fLaC':
-            mime = "audio/flac"
-        else:
-            mime = "audio/wav"
+        if raw[:4] == b'RIFF': mime = "audio/wav"
+        elif raw[:3] == b'ID3' or raw[:2] == b'\xff\xfb': mime = "audio/mp3"
+        elif raw[:4] == b'fLaC': mime = "audio/flac"
+        else: mime = "audio/wav"
     except:
         mime = "audio/wav"
     last_debug_info["detected_mime"] = mime
