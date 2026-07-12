@@ -642,6 +642,11 @@ async def answer_audio(request: Request):
 
     # Merge every explicit stat into the output.
     for stat_name, stat_dict in explicit_stats.items():
+        if isinstance(stat_dict, dict):
+            stat_dict = {
+                normalize_column(k): v
+                for k, v in stat_dict.items()
+            }
         if stat_name in out and isinstance(out[stat_name], dict) and isinstance(stat_dict, dict):
             out[stat_name].update(stat_dict)
 
