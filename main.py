@@ -138,6 +138,7 @@ async def answer_image(request: Request):
 async def extract(request: Request):
     body = await request.json()
 
+    # Q3: fixed invoice schema
     if "invoice_text" in body:
         text = body["invoice_text"]
         prompt = f"""Extract invoice fields from the text below.
@@ -177,6 +178,20 @@ Invoice text:
     text = body.get("text", "")
     schema = body.get("schema", {})
 
+    # schema could be a dict of {field: type} or a JSON Schema object
+    # Extract simple field→type map
+    if "properties" in schema:
+        # It's a JSON Schema — flatten it
+        props = schema.get("properties", {})
+        simple_schema = {}
+        for k, v in props.items():
+            t = v.get("type", "string")
+            if t == "number":
+                t = "float"
+            simple_schema[k] = t
+    else:
+        simple_schema = schema
+
     from datetime import datetime
 
     def coerce(value, type_str):
@@ -187,7 +202,7 @@ Invoice text:
                 return str(value)
             if type_str == "integer":
                 return int(float(re.sub(r'[^\d.-]', '', str(value))))
-            if type_str == "float":
+            if type_str in ("float", "number"):
                 return float(re.sub(r'[^\d.-]', '', str(value)))
             if type_str == "boolean":
                 if isinstance(value, bool):
@@ -214,25 +229,29 @@ Invoice text:
             pass
         return None
 
-    prompt = f"""Extract fields from the text. Return ONLY valid JSON with EXACTLY these keys:
-{json.dumps(schema, indent=2)}
+    field_list = "\n".join(f"- {k}: {v}" for k, v in simple_schema.items())
 
-Rules:
-- Use null if field not found
-- Numbers must be JSON numbers (not strings)
-- Dates must be YYYY-MM-DD
-- No extra keys, no missing keys
+    prompt = f"""Read the text below and extract these fields:
 
-Text:
-{text}"""
+{field_list}
+
+TEXT:
+{text}
+
+Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
+- Use null if a field is not found in the text
+- Dates must be YYYY-MM-DD format
+- Numbers must be JSON numbers not strings
+- No extra keys allowed"""
 
     try:
-        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=512)
+        raw = await chat([{"role": "user", "content": prompt}],
+                         model="gpt-4o-mini", max_tokens=512)
         extracted = parse_json(raw)
     except:
         extracted = {}
 
-    return JSONResponse({k: coerce(extracted.get(k), v) for k, v in schema.items()})
+    return JSONResponse({k: coerce(extracted.get(k), v) for k, v in simple_schema.items()})
 
 # ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
