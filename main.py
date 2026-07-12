@@ -178,10 +178,8 @@ Invoice text:
     text = body.get("text", "")
     schema = body.get("schema", {})
 
-    # schema could be a dict of {field: type} or a JSON Schema object
-    # Extract simple field→type map
+    # Handle JSON Schema object
     if "properties" in schema:
-        # It's a JSON Schema — flatten it
         props = schema.get("properties", {})
         simple_schema = {}
         for k, v in props.items():
@@ -199,9 +197,7 @@ Invoice text:
             return None
         try:
             if type_str == "string":
-                s = str(value)
-                # email fields lowercase karo
-                return s.lower() if "email" in str(value).lower() or "@" in s else s
+                return str(value)
             if type_str == "integer":
                 return int(float(re.sub(r'[^\d.-]', '', str(value))))
             if type_str in ("float", "number"):
@@ -231,6 +227,13 @@ Invoice text:
             pass
         return None
 
+    def coerce_field(k, value, type_str):
+        result = coerce(value, type_str)
+        # email fields hamesha lowercase
+        if isinstance(result, str) and ("email" in k.lower() or "@" in str(result)):
+            return result.lower()
+        return result
+
     field_list = "\n".join(f"- {k}: {v}" for k, v in simple_schema.items())
 
     prompt = f"""Read the text below and extract these fields:
@@ -244,6 +247,7 @@ Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
 - Use null if a field is not found in the text
 - Dates must be YYYY-MM-DD format
 - Numbers must be JSON numbers not strings
+- email fields must be lowercase
 - No extra keys allowed"""
 
     try:
@@ -253,7 +257,7 @@ Return a flat JSON object with EXACTLY these keys: {list(simple_schema.keys())}
     except:
         extracted = {}
 
-    return JSONResponse({k: coerce(extracted.get(k), v) for k, v in simple_schema.items()})
+    return JSONResponse({k: coerce_field(k, extracted.get(k), v) for k, v in simple_schema.items()})
 
 # ===== Q6: /answer-audio =====
 @app.post("/answer-audio")
