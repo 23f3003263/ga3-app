@@ -135,46 +135,48 @@ async def answer_image(request: Request):
         ans = ""
     return {"answer": str(ans)}
 
-# ===== Q3: /extract =====
-@app.post("/extract")
-async def extract(request: Request):
-    body = await request.json()
-
-    # Q3: invoice_text field
+# Q3: invoice_text field
     if "invoice_text" in body:
         text = body["invoice_text"]
         prompt = f"""Extract invoice fields from the text below.
-Return JSON with EXACTLY these keys (no extras, no missing):
-invoice_no, vendor, currency, total_amount, invoice_date, due_in_days, is_paid, priority, contact_email, line_items, item_count
+Return JSON with EXACTLY these 6 keys (no extras, no missing):
+invoice_no, date, vendor, amount, tax, currency
 
 Rules:
-- invoice_no: invoice number as string, null if not found
-- vendor: biller name exactly as written
-- currency: ISO 4217 code ONLY (₹=INR, $=USD, €=EUR, £=GBP, ¥=JPY)
-- total_amount: integer (12K=12000, "twelve thousand"=12000)
-- invoice_date: YYYY-MM-DD
-- due_in_days: integer ("Net 30"=30, "two weeks"=14)
-- is_paid: true if paid/cleared, false if pending/awaiting
-- priority: one of low/normal/high/urgent
-- contact_email: lowercase string, null if not found
-- line_items: array of objects with keys sku, quantity (int), unit_price (int)
-- item_count: integer count of line_items
+- invoice_no: invoice number as a string, null if not found
+- date: ISO format YYYY-MM-DD, null if not found
+- vendor: vendor/biller name exactly as written, null if not found
+- amount: the SUBTOTAL before tax, as a plain number (not a string), null if not found
+- tax: the tax amount only (e.g. the GST amount, not the grand total), as a plain number, null if not found
+- currency: ISO 4217 code. Rs./₹ = INR, $ = USD, € = EUR, £ = GBP, ¥ = JPY.
+  If a rupee symbol or "Rs." appears anywhere, use "INR".
 
 Invoice text:
 {text}"""
         try:
-            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=1500))
-            out["total_amount"] = int(float(str(out.get("total_amount", 0)).replace(",", "")))
-            out["due_in_days"] = int(out.get("due_in_days", 0))
-            out["is_paid"] = bool(out.get("is_paid", False))
-            out["item_count"] = int(out.get("item_count", len(out.get("line_items", []))))
-            out["contact_email"] = str(out.get("contact_email", "")).lower()
-            for item in out.get("line_items", []):
-                item["quantity"] = int(item.get("quantity", 0))
-                item["unit_price"] = int(float(str(item.get("unit_price", 0)).replace(",", "")))
-            return JSONResponse(out)
+            out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
         except Exception as e:
-            return JSONResponse({"error": str(e)}, status_code=500)
+            last_debug_info["q3_error"] = str(e)
+            out = {}
+
+        def to_number(v):
+            if v is None:
+                return None
+            try:
+                cleaned = str(v).replace(",", "").replace("Rs.", "").replace("₹", "").strip()
+                return float(cleaned)
+            except (ValueError, TypeError):
+                return None
+
+        result = {
+            "invoice_no": out.get("invoice_no") or None,
+            "date": out.get("date") or None,
+            "vendor": out.get("vendor") or None,
+            "amount": to_number(out.get("amount")),
+            "tax": to_number(out.get("tax")),
+            "currency": out.get("currency") or "INR",
+        }
+        return JSONResponse(result)
 
     # ===== Q7: document_id + text + schema =====
     text = body.get("text", "")
