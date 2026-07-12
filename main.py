@@ -80,6 +80,17 @@ async def root():
 @app.get("/debug")
 async def debug():
     return {"last": last_debug_info, "history": audio_history[-5:]}
+    
+@app.post("/debug-extract")
+async def debug_extract(request: Request):
+    body = await request.json()
+    return JSONResponse({
+        "received_keys": list(body.keys()),
+        "text_preview": body.get("text", "")[:200],
+        "schema": body.get("schema", {}),
+        "has_invoice_text": "invoice_text" in body,
+        "has_text": "text" in body,
+    })
 
 # ===== Q2: /answer-image =====
 def normalize_answer(ans):
