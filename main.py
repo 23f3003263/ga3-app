@@ -83,6 +83,19 @@ def parse_json(s):
     except Exception:
         m = re.search(r"\{.*\}", s, re.DOTALL)
         return json.loads(m.group(0)) if m else {}
+
+def normalize_column(col):
+    if not isinstance(col, str):
+        return col
+
+    col = col.strip()
+
+    # "점수 1" -> "점수1"
+    col = re.sub(r'([가-힣A-Za-z])\s+(\d)', r'\1\2', col)
+    col = re.sub(r'(\d)\s+([가-힣A-Za-z])', r'\1\2', col)
+
+    return col
+    
 @app.get("/")
 async def root():
     return {"ok": True, "email": config.EMAIL}
