@@ -80,7 +80,7 @@ async def root():
 @app.get("/debug")
 async def debug():
     return {"last": last_debug_info, "history": audio_history[-5:]}
-    
+
 @app.post("/debug-extract")
 async def debug_extract(request: Request):
     body = await request.json()
@@ -135,10 +135,29 @@ async def answer_image(request: Request):
         ans = ""
     return {"answer": str(ans)}
 
-# Q3: invoice_text field
+# ===== Q3 & Q7: /extract =====
+@app.post("/extract")
+async def extract(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    # Q3: invoice_text field
     if "invoice_text" in body:
-        text = body["invoice_text"]
-        prompt = f"""Extract invoice fields from the text below.
+        text = body.get("invoice_text", "") or ""
+
+        result = {
+            "invoice_no": None,
+            "date": None,
+            "vendor": None,
+            "amount": None,
+            "tax": None,
+            "currency": "INR",
+        }
+
+        try:
+            prompt = f"""Extract invoice fields from the text below.
 Return JSON with EXACTLY these 6 keys (no extras, no missing):
 invoice_no, date, vendor, amount, tax, currency
 
@@ -147,35 +166,32 @@ Rules:
 - date: ISO format YYYY-MM-DD, null if not found
 - vendor: vendor/biller name exactly as written, null if not found
 - amount: the SUBTOTAL before tax, as a plain number (not a string), null if not found
-- tax: the tax amount only (e.g. the GST amount, not the grand total), as a plain number, null if not found
+- tax: the tax amount only (e.g. the GST/IGST/VAT amount, not the grand total), as a plain number, null if not found
 - currency: ISO 4217 code. Rs./₹ = INR, $ = USD, € = EUR, £ = GBP, ¥ = JPY.
   If a rupee symbol or "Rs." appears anywhere, use "INR".
 
 Invoice text:
 {text}"""
-        try:
             out = parse_json(await chat([{"role": "user", "content": prompt}], max_tokens=800))
+
+            def to_number(v):
+                if v is None:
+                    return None
+                try:
+                    cleaned = str(v).replace(",", "").replace("Rs.", "").replace("₹", "").strip()
+                    return float(cleaned)
+                except (ValueError, TypeError):
+                    return None
+
+            result["invoice_no"] = out.get("invoice_no") or None
+            result["date"] = out.get("date") or None
+            result["vendor"] = out.get("vendor") or None
+            result["amount"] = to_number(out.get("amount"))
+            result["tax"] = to_number(out.get("tax"))
+            result["currency"] = out.get("currency") or "INR"
         except Exception as e:
             last_debug_info["q3_error"] = str(e)
-            out = {}
 
-        def to_number(v):
-            if v is None:
-                return None
-            try:
-                cleaned = str(v).replace(",", "").replace("Rs.", "").replace("₹", "").strip()
-                return float(cleaned)
-            except (ValueError, TypeError):
-                return None
-
-        result = {
-            "invoice_no": out.get("invoice_no") or None,
-            "date": out.get("date") or None,
-            "vendor": out.get("vendor") or None,
-            "amount": to_number(out.get("amount")),
-            "tax": to_number(out.get("tax")),
-            "currency": out.get("currency") or "INR",
-        }
         return JSONResponse(result)
 
     # ===== Q7: document_id + text + schema =====
@@ -227,13 +243,11 @@ Return a JSON object matching this schema exactly:
             )
             if r.status_code == 200:
                 result = json.loads(r.json()["choices"][0]["message"]["content"])
-                # Fix email lowercase
                 for k, v in result.items():
                     if isinstance(v, str) and ("email" in k.lower() or "@" in v):
                         result[k] = v.lower()
                 return JSONResponse(result)
             else:
-                # Fallback: plain json_object
                 r2 = await c.post(
                     f"{config.AIPIPE_BASE}/chat/completions",
                     headers=HEAD,
